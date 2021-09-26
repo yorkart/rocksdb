@@ -36,10 +36,29 @@ class BytewiseComparatorImpl : public Comparator {
 
   bool Equal(const Slice& a, const Slice& b) const override { return a == b; }
 
+  /**
+   * 提取start和limit的最小前缀，结果放到start中。
+   * 先尝试返回公共前缀的后继，再尝试返回start自身。
+   * 前提：start和limit大小关系不一定
+   * 求值：Min(result)
+   * 满足：result >= start && result < limit
+   * eg：[]表示变化的值
+   *      start          limit     => result
+   *   1. a b c          a b c     => a b c
+   *   2. a b c          a b c d   => a b c
+   *   3. a b c          a b c d   => a b c
+   *   4. a b c a        a b d e   => a b c [b]
+   *   5. a b c \0xff a  a b d     => a b c 0xff [b]
+   * @param start
+   * @param limit
+   */
   void FindShortestSeparator(std::string* start,
                              const Slice& limit) const override {
     // Find length of common prefix
+    // 两个字符串的最小长度
     size_t min_length = std::min(start->size(), limit.size());
+
+    // 从0开始比较两个字符串，找到存在不同字符的索引下标
     size_t diff_index = 0;
     while ((diff_index < min_length) &&
            ((*start)[diff_index] == limit[diff_index])) {
@@ -48,20 +67,34 @@ class BytewiseComparatorImpl : public Comparator {
 
     if (diff_index >= min_length) {
       // Do not shorten if one string is a prefix of the other
+      // 说明limit完全前缀包含start。start就不用赋值之类调整，本身就是公共前缀
     } else {
       uint8_t start_byte = static_cast<uint8_t>((*start)[diff_index]);
       uint8_t limit_byte = static_cast<uint8_t>(limit[diff_index]);
       if (start_byte >= limit_byte) {
         // Cannot shorten since limit is smaller than start or start is
         // already the shortest possible.
+        // 从差异位置的第一个字符判断，如果start>limit，不符合该方法语义，放弃，直接返回
         return;
       }
       assert(start_byte < limit_byte);
 
       if (diff_index < limit.size() - 1 || start_byte + 1 < limit_byte) {
+        // 快速检测，如果满足在diff_index位置把字符加1，截取start返回
+        // eg:
+        //   start: abc, limit: abd， 不满足，c + 1后，导致start == limit。
+        //   start: abcb, limit: abda， 不满足，c + 1后，导致start > limit。
+        //   start: abc, limit: abda, 满足， c + 1后，abd < abda， 返回abd。（满足条件：diff_index < limit.size() - 1）
+        //   start: abc, limit: abe,  满足， c+1 < e， 返回abd。（满足条件：start_byte + 1 < limit_byte）
         (*start)[diff_index]++;
         start->resize(diff_index + 1);
       } else {
+        // 这里针对的情况：
+        // eg:
+        //   start: abc, limit: abd
+        //   start: abcbbb, limit: abdaaa，虽然c比d小，但后续start都比limit大
+        //   start: abcb, limit: abda，虽然c比d小，但后续start都比limit大
+
         //     v
         // A A 1 A A A
         // A A 2
@@ -87,6 +120,18 @@ class BytewiseComparatorImpl : public Comparator {
     }
   }
 
+  /**
+   * key最短后继。将key变成一个比原key大的短字符串，并赋值给*key返回
+   * 求值：Min(result)
+   * 满足：result > key
+   * eg：
+   *      key         => result
+   *   1. a           => b
+   *   2. a a a       => b
+   *   3. \0xff a     => \0xff b
+   *   4. \0xff \0xff => \0xff \0xff
+   * @param key
+   */
   void FindShortSuccessor(std::string* key) const override {
     // Find first character that can be incremented
     size_t n = key->size();
@@ -101,14 +146,33 @@ class BytewiseComparatorImpl : public Comparator {
     // *key is a run of 0xffs.  Leave it alone.
   }
 
+  /**
+   * 给定两个slice s和t，判断t是不是s的后继
+   * eg: []表示变化的值，([empty]除外)
+   *      s            t               result
+   *   1. [empty]      [empty]      => false 都为空，不存在后继关系
+   *   2. 1 2 3        1 2 3 0      => false 长度不一致
+   *   2. 1 2 3        1 2 3        => false 相等，不存在后继关系
+   *   3. 1 2 3        1 2 [4]      => true  满足长度一致，尾部差1
+   *   4. 1 2 3 0xff   1 2 [4] 0x00 => true  满足类似进位操作，3 0xff +1 = 4 0x00
+   * @param s
+   * @param t
+   * @return
+   */
   bool IsSameLengthImmediateSuccessor(const Slice& s,
                                       const Slice& t) const override {
+    // 大小为0，或长度不一样，直接返回false
     if (s.size() != t.size() || s.size() == 0) {
       return false;
     }
+
+    // 两个slice中首个字节不等的索引位置
     size_t diff_ind = s.difference_offset(t);
+
     // same slice
+    // diff_ind越界，说明没找到不等的索引位置，也就是连个slice相等
     if (diff_ind >= s.size()) return false;
+
     uint8_t byte_s = static_cast<uint8_t>(s[diff_ind]);
     uint8_t byte_t = static_cast<uint8_t>(t[diff_ind]);
     // first different byte must be consecutive, and remaining bytes must be
