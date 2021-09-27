@@ -18,6 +18,11 @@ namespace ROCKSDB_NAMESPACE {
 
 // An array of core-local values. Ideally the value type, T, is cache aligned to
 // prevent false sharing.
+/**
+ * 根据cpu核数构造数组，进行缓存数据。
+ * 类似于threadlocal，只不过是跟cpu core绑定的
+ * @tparam T
+ */
 template <typename T>
 class CoreLocalArray {
  public:
@@ -40,6 +45,12 @@ class CoreLocalArray {
   int size_shift_;
 };
 
+/**
+ * 根据cpu个数，按照2的次方对齐，计算该值，且该值最少为8。
+ * 根据计算值，构造data_数据
+ * eg: cpu: 1 => 8, cpu: 9 => 16
+ * @tparam T
+ */
 template <typename T>
 CoreLocalArray<T>::CoreLocalArray() {
   int num_cpus = static_cast<int>(std::thread::hardware_concurrency());
@@ -61,6 +72,11 @@ T* CoreLocalArray<T>::Access() const {
   return AccessElementAndIndex().first;
 }
 
+/**
+ * 根据所在cpuid，获取对应索引位置的数据
+ * @tparam T
+ * @return
+ */
 template <typename T>
 std::pair<T*, size_t> CoreLocalArray<T>::AccessElementAndIndex() const {
   int cpuid = port::PhysicalCoreID();
@@ -69,11 +85,18 @@ std::pair<T*, size_t> CoreLocalArray<T>::AccessElementAndIndex() const {
     // cpu id unavailable, just pick randomly
     core_idx = Random::GetTLSInstance()->Uniform(1 << size_shift_);
   } else {
+    // 取余cpuid % 1<< size_shift_
     core_idx = static_cast<size_t>(cpuid & ((1 << size_shift_) - 1));
   }
   return {AccessAtCore(core_idx), core_idx};
 }
 
+/**
+ * 根据下标，定位数据
+ * @tparam T
+ * @param core_idx
+ * @return
+ */
 template <typename T>
 T* CoreLocalArray<T>::AccessAtCore(size_t core_idx) const {
   assert(core_idx < static_cast<size_t>(1) << size_shift_);

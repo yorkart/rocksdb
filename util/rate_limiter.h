@@ -74,6 +74,11 @@ class GenericRateLimiter : public RateLimiter {
   int64_t CalculateRefillBytesPerPeriod(int64_t rate_bytes_per_sec);
   Status Tune();
 
+  /**
+   * 纳秒转毫秒
+   * std::milli::den，milli为ratio<1LL,1000LL> ，den为分母，也就是1000
+   * @return
+   */
   uint64_t NowMicrosMonotonic() { return clock_->NowNanos() / std::milli::den; }
 
   // This mutex guard all internal states
@@ -81,8 +86,14 @@ class GenericRateLimiter : public RateLimiter {
 
   const int64_t kMinRefillBytesPerPeriod = 100;
 
+  /**
+   * token被更新填充的周期，默认为100ms
+   */
   const int64_t refill_period_us_;
 
+  /**
+   * 每秒字节限速
+   */
   int64_t rate_bytes_per_sec_;
   // This variable can be changed dynamically.
   std::atomic<int64_t> refill_bytes_per_period_;
@@ -92,19 +103,40 @@ class GenericRateLimiter : public RateLimiter {
   port::CondVar exit_cv_;
   int32_t requests_to_wait_;
 
+  /**
+   * 每个优先级队列申请的字节数
+   */
   int64_t total_requests_[Env::IO_TOTAL];
+  /**
+   * 每个优先级队列已经分配的字节数
+   */
   int64_t total_bytes_through_[Env::IO_TOTAL];
+  /**
+   * 本期窗口的字节数配额
+   */
   int64_t available_bytes_;
+  /**
+   * 本期refill窗口的结束位置，也是下一个窗口起始位置
+   */
   int64_t next_refill_us_;
 
+  /**
+   * 低优先级请求(compaction)相较高优先级请求(flush)获取token的概率。默认为10%
+   */
   int32_t fairness_;
   Random rnd_;
 
   struct Req;
+  /**
+   * 竞争的结果
+   */
   Req* leader_;
   std::deque<Req*> queue_[Env::IO_TOTAL];
 
   bool auto_tuned_;
+  /**
+   * 用完多少个配额窗口的计数
+   */
   int64_t num_drains_;
   int64_t prev_num_drains_;
   const int64_t max_bytes_per_sec_;

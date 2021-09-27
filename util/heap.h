@@ -37,6 +37,11 @@ namespace ROCKSDB_NAMESPACE {
 // std::priority_queue: the comparison operator is expected to provide the
 // less-than relation, but top() will return the maximum.
 
+/**
+ * 二叉堆
+ * @tparam T
+ * @tparam Compare
+ */
 template<typename T, typename Compare = std::less<T>>
 class BinaryHeap {
  public:

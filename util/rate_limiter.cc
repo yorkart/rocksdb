@@ -17,6 +17,16 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+/**
+ * 请求令牌来读取或写入字节并可能更新统计信息。
+ * 考虑GetSingleBurstBytes()和对齐(例如，在直接I/O的情况下)来分配适当的字节数，这可能少于请求的字节数。
+ * @param bytes 请求操作字节数
+ * @param alignment 对齐大小
+ * @param io_priority 操作优先级
+ * @param stats 输出参数，操作状态
+ * @param op_type
+ * @return
+ */
 size_t RateLimiter::RequestToken(size_t bytes, size_t alignment,
                                  Env::IOPriority io_priority, Statistics* stats,
                                  RateLimiter::OpType op_type) {
@@ -99,6 +109,13 @@ void GenericRateLimiter::SetBytesPerSecond(int64_t bytes_per_second) {
       std::memory_order_relaxed);
 }
 
+/**
+ * 请求一个token
+ * 每个周期可获取token流量：token = rate_bytes_per_sec * (refill_period_us / 1000) ms / 1000ms
+ * @param bytes 申请操作的字节大小
+ * @param pri 操作优先级
+ * @param stats 输出参数，操作统计
+ */
 void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
                                  Statistics* stats) {
   assert(bytes <= refill_bytes_per_period_.load(std::memory_order_relaxed));
@@ -121,18 +138,21 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
     return;
   }
 
+  // 对应优先级的操作次数计数
   ++total_requests_[pri];
 
+  // 剩余字节额度满足
   if (available_bytes_ >= bytes) {
     // Refill thread assigns quota and notifies requests waiting on
     // the queue under mutex. So if we get here, that means nobody
     // is waiting?
-    available_bytes_ -= bytes;
-    total_bytes_through_[pri] += bytes;
+    available_bytes_ -= bytes; // 获取额度
+    total_bytes_through_[pri] += bytes; // 对应优先级的分配字节统计
     return;
   }
 
   // Request cannot be satisfied at this moment, enqueue
+  // 额度不够， 把申请封装成Req放到队列
   Req r(bytes, &request_mutex_);
   queue_[pri].push_back(&r);
 
@@ -149,15 +169,29 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
             &r == queue_[Env::IO_HIGH].front()) ||
          (!queue_[Env::IO_LOW].empty() &&
             &r == queue_[Env::IO_LOW].front()))) {
+      // 如果当前没有leader，且队首（先high再low判断）是自己，说明自己是竞争到了leader
+      // 疑问：入队是queue_[pri].push_back(&r)，指定了pri；查找为什么还要指定high和low
+
+      // 竞争到leader_
       leader_ = &r;
+
+      // 查出refill窗口内的剩余时间
       int64_t delta = next_refill_us_ - NowMicrosMonotonic();
       delta = delta > 0 ? delta : 0;
+
       if (delta == 0) {
+        // 窗口过期
         timedout = true;
       } else {
+        // 计算可以在本次窗口内的等待时长
         int64_t wait_until = clock_->NowMicros() + delta;
+
+        // todo: 消费次数计数？
         RecordTick(stats, NUMBER_RATE_LIMITER_DRAINS);
+
+        // 一个配额窗口用完，增加计数
         ++num_drains_;
+        // 这里模拟阻塞，因为窗口配额分配完了，但时间还没到，这里等到到窗口边界
         timedout = r.cv.TimedWait(wait_until);
       }
     } else {
@@ -186,12 +220,17 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
 
     if (leader_ == &r) {
       // Waken up from TimedWait()
+      // 窗口超时到期，开启填充下一个窗口
       if (timedout) {
         // Time to do refill!
+        // 填充下一个窗口配额
         Refill();
 
         // Re-elect a new leader regardless. This is to simplify the
         // election handling.
+        // 这里表明要重新选举。因为Refill()会对队列里请求，尝试进行处理。
+        // 有可能全处理，有可能处理一半。就是处理进度不确定，leader_对象有没有被处理也不确定，
+        // 那重新选举就好了。
         leader_ = nullptr;
 
         // Notify the header of queue if current leader is going away
@@ -228,36 +267,65 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
   } while (!r.granted);
 }
 
+/**
+ * 重新分配窗口，填充token配额
+ * 1. 把上一期没用完的配额，加到当期
+ * 2. 对上一期优先级队列里的请求，协助处理
+ */
 void GenericRateLimiter::Refill() {
   TEST_SYNC_POINT("GenericRateLimiter::Refill");
+  // 本期refill窗口的结束位置
   next_refill_us_ = NowMicrosMonotonic() + refill_period_us_;
+
   // Carry over the left over quota from the last period
+  // 上一期窗口配额没用完，转接到本期。
   auto refill_bytes_per_period =
       refill_bytes_per_period_.load(std::memory_order_relaxed);
   if (available_bytes_ < refill_bytes_per_period) {
     available_bytes_ += refill_bytes_per_period;
   }
 
+  // 根据优先级计算，如果fairness_ = 10， rnd_.OneIn(fairness_)为true表示1/10概率
+  // 计算结果：1/10概率为0，9/10概率为1。0和1用于配合后面循环
   int use_low_pri_first = rnd_.OneIn(fairness_) ? 0 : 1;
+
   for (int q = 0; q < 2; ++q) {
+    // 循环两次，q值分别为0和1，use_low_pri_first也是0和1，
+    // 两轮循环use_pri结果只有两种：1. IO_LOW、IO_HIGH， 2.IO_HIGH、IO_LOW
+    // 集合use_low_pri_first的概率，得出结论：
+    // 1/10概率，先取IO_LOW队列进行执行；9/10概率取IO_HIGH队列进行执行。
     auto use_pri = (use_low_pri_first == q) ? Env::IO_LOW : Env::IO_HIGH;
+
+    // 按概率定位优先级队列
     auto* queue = &queue_[use_pri];
     while (!queue->empty()) {
       auto* next_req = queue->front();
+
+      // 申请字节数太大了。 这里直接break，没有进行next_req->granted，相当于不处理了
+      // 这里应该是要等到下一个窗口，在统计
       if (available_bytes_ < next_req->request_bytes) {
         // avoid starvation
+        // 以为超出当前窗口配额，先扣除，直接退出，等到下个窗口分配时在检查是否够。
         next_req->request_bytes -= available_bytes_;
+        // 当前窗口配额清零
         available_bytes_ = 0;
         break;
       }
+
+      // 扣除配额
       available_bytes_ -= next_req->request_bytes;
       next_req->request_bytes = 0;
+      // 已分配计数
       total_bytes_through_[use_pri] += next_req->bytes;
+      // 出队该请求
       queue->pop_front();
 
+      // 标记配额已授权
       next_req->granted = true;
+
       if (next_req != leader_) {
         // Quota granted, signal the thread
+        // 配额已经授权，唤醒等待线程
         next_req->cv.Signal();
       }
     }

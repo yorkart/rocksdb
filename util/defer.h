@@ -36,6 +36,9 @@ namespace ROCKSDB_NAMESPACE {
 //
 // With the help of Defer, you can centralize the cleanup logic inside the
 // lambda passed to Defer, and you can return immediately on failure when necessary.
+/**
+ * 绑定一个回调，在Defer实例消耗时调用
+ */
 class Defer final {
  public:
   Defer(std::function<void()>&& fn) : fn_(std::move(fn)) {}
